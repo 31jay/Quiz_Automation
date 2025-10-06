@@ -4,7 +4,7 @@ import pytesseract
 import cv2
 import os
 from difflib import SequenceMatcher
-from answerProviderTest import AnswerProvider
+from answerProviderMain import AnswerProvider
 
 # Configuration
 GUTTER = 0.01
@@ -75,6 +75,41 @@ def extract_text_data(image_input, lang='nep+eng'):
     ocr_data = pytesseract.image_to_data(processed, config=config, 
                                         output_type=pytesseract.Output.DICT)
     return ocr_data
+
+
+def detect_submit_button_ocr(ocr_data, min_y=0):
+    """Detect Submit button using OCR text detection."""
+    submit_keywords = ["Submit", "SUBMIT", "submit", "Done", "DONE", "Confirm", "CONFIRM"]
+    
+    for i, word in enumerate(ocr_data['text']):
+        word_clean = (word or "").strip()
+        if not word_clean:
+            continue
+            
+        # Check if word matches submit keywords
+        if any(keyword in word_clean for keyword in submit_keywords):
+            try:
+                y = int(ocr_data['top'][i])
+                # Only consider submit buttons below the minimum Y (below options)
+                if y > min_y:
+                    x = int(ocr_data['left'][i] + ocr_data['width'][i] // 2)
+                    y_center = int(ocr_data['top'][i] + ocr_data['height'][i] // 2)
+                    print(f"✓ Submit button detected via OCR: '{word_clean}' @ ({x}, {y_center})")
+                    return (x, y_center)
+            except (ValueError, KeyError):
+                continue
+    
+    return None
+
+
+def detect_submit_from_screenshot(screenshot_path='screenshot.png', submit_coord_y=0):
+    """Take screenshot and detect submit button using OCR."""
+    try:
+        ocr_data = extract_text_data(screenshot_path, lang='eng')
+        submit_coords = detect_submit_button_ocr(ocr_data, min_y=submit_coord_y)
+        return submit_coords
+    except:
+        return None
 
 
 # -----------------------
@@ -252,14 +287,23 @@ def crop_and_extract_content(y_min, y_max, text_height, image, ocr_data):
         
         if boxes:
             last_box = boxes[-1]
-            # Use BOTTOM Y coordinate of last option box for more accurate positioning
             last_y = last_box[1] + last_box[3]  # Bottom of last option
-            # Reduced spacing for more accurate submit positioning
-            submit_y = int(last_y + 2 * text_height)
-            submit_x = img_width // 2
-            tap_coords['submit'] = (submit_x, submit_y)
+            
+            # 1. Try to detect Submit button via OCR first
+            submit_ocr_coords = detect_submit_button_ocr(ocr_data, min_y=last_y)
+            if submit_ocr_coords:
+                tap_coords['submit'] = submit_ocr_coords
+                tap_coords['submit_detected'] = True  # Flag that submit was found via OCR
+                print(f"✓ Submit detected via OCR @ {submit_ocr_coords}")
+            else:
+                # Fallback to calculated position
+                submit_y = int(last_y + 2 * text_height)
+                submit_x = img_width // 2
+                tap_coords['submit'] = (submit_x, submit_y)
+                tap_coords['submit_detected'] = False  # Flag that submit was calculated
+                print(f"✓ Submit calculated @ ({submit_x}, {submit_y}) - 2*text_height below last option")
+            
             tap_coords['last_option_y'] = last_y
-            print(f"✓ Submit calculated @ ({submit_x}, {submit_y}) - 2*text_height below last option")
     
     else:
         # Fallback: OCR-based line grouping (from original test.py)
@@ -334,15 +378,24 @@ def crop_and_extract_content(y_min, y_max, text_height, image, ocr_data):
         if lines:
             last_indices = lines[-1]
             try:
-                # Use bottom Y coordinate of last option text
                 last_y = max([int(ocr_data['top'][i] + ocr_data['height'][i]) 
                              for i in last_indices])
-                # Reduced spacing for more accurate submit positioning
-                submit_y = last_y + int(2 * text_height)
-                submit_x = img_width // 2
-                tap_coords['submit'] = (submit_x, submit_y)
+                
+                # 1. Try to detect Submit button via OCR first
+                submit_ocr_coords = detect_submit_button_ocr(ocr_data, min_y=last_y)
+                if submit_ocr_coords:
+                    tap_coords['submit'] = submit_ocr_coords
+                    tap_coords['submit_detected'] = True  # Flag that submit was found via OCR
+                    print(f"✓ Submit detected via OCR @ {submit_ocr_coords}")
+                else:
+                    # Fallback to calculated position
+                    submit_y = last_y + int(2 * text_height)
+                    submit_x = img_width // 2
+                    tap_coords['submit'] = (submit_x, submit_y)
+                    tap_coords['submit_detected'] = False  # Flag that submit was calculated
+                    print(f"✓ Submit calculated @ ({submit_x}, {submit_y}) - 2*text_height below last option")
+                
                 tap_coords['last_option_y'] = last_y
-                print(f"✓ Submit calculated @ ({submit_x}, {submit_y}) - 2*text_height below last option")
             except:
                 tap_coords['submit'] = (img_width // 2, int(0.85 * img_height))
                 print(f"⚠ Submit fallback @ default position")
@@ -411,6 +464,32 @@ def get_answer_coordinates():
     return answer_coords, submit_coords
 
 
+def blind_tap_submit():
+    """Blind tap for submit button from bottom UP to just above last option."""
+    print("⚠ Performing blind submit tapping from bottom UP to above last option...")
+    
+    x = img_width // 2
+    last_option_y = tap_coords.get('last_option_y', int(0.7 * img_height))
+    
+    # Tap from bottom UP to just above last option (not equal to it)
+    start_y = int(0.95 * img_height)  # Start from near bottom
+    end_y = int(last_option_y + 0.03 * img_height)  # Stop 20px below last option to avoid tapping it
+    
+    # Calculate step size for systematic coverage
+    total_range = start_y - end_y
+    step_size = max(40, total_range // 8)  # ~8 taps across the range
+    
+    tap_count = 0
+    y = start_y
+    while y >= end_y and tap_count < 10:  # Safety limit, going UP
+        adb_tap_xy(x, y)
+        y -= step_size  # Decrement Y to go UP
+        tap_count += 1
+        # No sleep for maximum speed
+    
+    print(f"✓ Performed {tap_count} submit blind taps from y={start_y} UP to y={end_y} (above last option at {last_option_y})")
+
+
 # -----------------------
 # Next Button (tess.py logic)
 # -----------------------
@@ -419,7 +498,7 @@ def tap_next_button():
     if not adb_screenshot('after_submit.png'):
         return False
     
-    time.sleep(0.3)
+    time.sleep(0.1)
     
     image = cv2.imread('after_submit.png')
     extracted = extract_text_data('after_submit.png', lang='eng')
@@ -445,26 +524,28 @@ def tap_next_button():
             print("✓ Detected 'Exit' button - Quiz Complete!")
             return False
     
-    # Fallback: Fast blind tapping below submit button
+    # 3. Fallback: Fast blind tapping from BOTTOM UP to avoid option taps
     print("⚠ 'Next' button not detected via OCR")
-    print("→ Fast blind tapping for Next button...")
+    print("→ Quick blind tapping from bottom UP to avoid options...")
     
     x = img_width // 2
     submit_coord_y = tap_coords.get('submit', (0, 0))[1]
     
-    # Start from just below submit button and tap downwards
-    start_y = submit_coord_y + int(0.02 * img_height)  # Start 2% below submit
-    end_y = int(0.95 * img_height)  # Stop at 95% of screen height
+    # Tap from bottom of screen UP to submit coordinate (reverse direction)
+    start_y = int(0.95 * img_height)  # Start from near bottom
+    end_y = max(submit_coord_y, int(0.65 * img_height))  # End at submit or 70% of screen
+    
+    # Calculate step size for ~8 taps
+    step_size = max(40, (start_y - end_y) // 8)
     
     tap_count = 0
     y = start_y
-    while y < end_y:
+    while y >= end_y and tap_count < 12:  # Safety limit, going UP
         adb_tap_xy(x, y)
-        y += 50  # Increased step size from 25px to 50px
+        y -= step_size  # Decrement Y to go UP
         tap_count += 1
-        time.sleep(0.01)  # Much faster - reduced from 0.05s to 0.01s
     
-    print(f"✓ Performed {tap_count} fast blind taps")
+    print(f"✓ Performed {tap_count} quick blind taps from bottom y={start_y} UP to y={end_y}")
     return True
 
 
@@ -490,7 +571,7 @@ def main():
         print("📸 Capturing screenshot...")
         if not adb_screenshot('screenshot.png'):
             print("⚠ Screenshot failed, retrying...")
-            time.sleep(2)
+            time.sleep(1)
             continue
         print("✓ Screenshot captured")
         
@@ -498,7 +579,7 @@ def main():
         image = cv2.imread('screenshot.png')
         if image is None:
             print("⚠ Failed to load image, retrying...")
-            time.sleep(2)
+            time.sleep(1)
             continue
         
         img_height, img_width = image.shape[:2]
@@ -510,7 +591,7 @@ def main():
             print("✓ OCR completed")
         except Exception as e:
             print(f"⚠ OCR failed: {e}")
-            time.sleep(2)
+            time.sleep(1)
             continue
         
         # Detect question
@@ -518,7 +599,7 @@ def main():
         bounds = detect_question_bounds(ocr_data)
         if not bounds:
             print("⚠ Could not detect question bounds")
-            time.sleep(2)
+            time.sleep(1)
             continue
         
         y_min, y_max, text_height = bounds
@@ -530,7 +611,7 @@ def main():
         print("✂️ Cropping question and options...")
         if not crop_and_extract_content(y_min, y_max, text_height, image, ocr_data):
             print("⚠ Content extraction failed")
-            time.sleep(2)
+            time.sleep(1)
             continue
         
         # Check duplicate
@@ -540,7 +621,7 @@ def main():
             retry_count += 1
             print(f"⚠ Duplicate question detected (retry {retry_count}/{MAX_RETRIES})")
             if retry_count < MAX_RETRIES:
-                time.sleep(2)
+                time.sleep(0.3)
                 continue
             else:
                 print("→ Proceeding despite duplicate...")
@@ -558,21 +639,49 @@ def main():
             
             print(f"👆 Tapping answer @ ({answer_coords[0]}, {answer_coords[1]})")
             adb_tap_xy(answer_coords[0], answer_coords[1])
-            time.sleep(0.5)
+            time.sleep(0.1)  # Reduced sleep time
             
-            print(f"👆 Tapping submit @ ({submit_coords[0]}, {submit_coords[1]})")
-            adb_tap_xy(submit_coords[0], submit_coords[1])
-            time.sleep(0.5)
+            # Handle Submit Button Detection & Tapping (3-step workflow)
+            submit_success = False
+            
+            # Step 1: Check if submit was detected via OCR during question processing
+            if tap_coords.get('submit_detected', False):
+                print(f"👆 Tapping submit (OCR detected during processing) @ {tap_coords['submit']}")
+                adb_tap_xy(tap_coords['submit'][0], tap_coords['submit'][1])
+                submit_success = True
+            
+            # Step 2: If not detected initially, take screenshot and detect submit via OCR
+            if not submit_success:
+                print("🔍 Submit not OCR-detected initially, taking screenshot for detection...")
+                if adb_screenshot('after_answer.png'):
+                    time.sleep(0.05)  # Brief pause for screenshot
+                    secondary_submit = detect_submit_from_screenshot('after_answer.png', 
+                                                                   tap_coords.get('last_option_y', 0))
+                    if secondary_submit:
+                        tap_coords['submit'] = secondary_submit
+                        print(f"👆 Tapping submit (re-detected via OCR) @ {secondary_submit}")
+                        adb_tap_xy(secondary_submit[0], secondary_submit[1])
+                        submit_success = True
+            
+            # Step 3: If both OCR attempts failed, use blind tapping from bottom to above last option
+            if not submit_success:
+                print("⚠ Submit OCR detection failed twice, using blind tapping...")
+                blind_tap_submit()
+            
+            time.sleep(0.1)  # Wait after submit attempt
             
         except Exception as e:
             print(f"⚠ Error during answer selection: {e}")
-            time.sleep(2)
+            # If answer selection fails, try blind submit as last resort
+            print("→ Attempting blind submit as fallback...")
+            blind_tap_submit()
+            time.sleep(0.1)
             continue
         
         # Tap Next
         print("🔄 Looking for Next button...")
         tap_next_button()
-        time.sleep(0.5)
+        time.sleep(0.2)  # Reduced for faster execution
         
         # Update solved count based on OCR
         questions_solved += 1
